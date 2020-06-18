@@ -8,6 +8,7 @@ interface ControlledTypeScriptSystem extends ts.System {
   // control watcher
   invokeFileChanged(path: string): void;
   invokeFileDeleted(path: string): void;
+  invokeQueuedChanged(): void;
   // control cache
   clearCache(): void;
   // mark these methods as defined - not optional
@@ -41,9 +42,10 @@ function createControlledTypeScriptSystem(
   mode: FileSystemMode = 'readonly'
 ): ControlledTypeScriptSystem {
   // watchers
-  const fileWatchersMap = new Map<string, ts.FileWatcherCallback[]>();
-  const directoryWatchersMap = new Map<string, ts.DirectoryWatcherCallback[]>();
-  const recursiveDirectoryWatchersMap = new Map<string, ts.DirectoryWatcherCallback[]>();
+  const fileWatcherCallbacksMap = new Map<string, ts.FileWatcherCallback[]>();
+  const directoryWatcherCallbacksMap = new Map<string, ts.DirectoryWatcherCallback[]>();
+  const recursiveDirectoryWatcherCallbacksMap = new Map<string, ts.DirectoryWatcherCallback[]>();
+  const queuedWatcherCallbacksSet = new Set<() => void>();
   const deletedFiles = new Map<string, boolean>();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const timeoutCallbacks = new Set<any>();
@@ -82,10 +84,12 @@ function createControlledTypeScriptSystem(
   function invokeFileWatchers(path: string, event: ts.FileWatcherEventKind) {
     const normalizedPath = realFileSystem.normalizePath(path);
 
-    const fileWatchers = fileWatchersMap.get(normalizedPath);
-    if (fileWatchers) {
+    const fileWatcherCallbacks = fileWatcherCallbacksMap.get(normalizedPath);
+    if (fileWatcherCallbacks) {
       // typescript expects normalized paths with posix forward slash
-      fileWatchers.forEach((fileWatcher) => fileWatcher(forwardSlash(normalizedPath), event));
+      fileWatcherCallbacks.forEach((fileWatcherCallback) =>
+        fileWatcherCallback(forwardSlash(normalizedPath), event)
+      );
     }
   }
 
@@ -97,24 +101,26 @@ function createControlledTypeScriptSystem(
       return;
     }
 
-    const directoryWatchers = directoryWatchersMap.get(directory);
-    if (directoryWatchers) {
-      directoryWatchers.forEach((directoryWatcher) =>
-        directoryWatcher(forwardSlash(normalizedPath))
+    const directoryWatcherCallbacks = directoryWatcherCallbacksMap.get(directory);
+    if (directoryWatcherCallbacks) {
+      directoryWatcherCallbacks.forEach((directoryWatcherCallback) =>
+        directoryWatcherCallback(forwardSlash(normalizedPath))
       );
     }
 
-    recursiveDirectoryWatchersMap.forEach((recursiveDirectoryWatchers, watchedDirectory) => {
-      if (
-        watchedDirectory === directory ||
-        (directory.startsWith(watchedDirectory) &&
-          forwardSlash(directory)[watchedDirectory.length] === '/')
-      ) {
-        recursiveDirectoryWatchers.forEach((recursiveDirectoryWatcher) =>
-          recursiveDirectoryWatcher(forwardSlash(normalizedPath))
-        );
+    recursiveDirectoryWatcherCallbacksMap.forEach(
+      (recursiveDirectoryWatcherCallbacks, watchedDirectory) => {
+        if (
+          watchedDirectory === directory ||
+          (directory.startsWith(watchedDirectory) &&
+            forwardSlash(directory)[watchedDirectory.length] === '/')
+        ) {
+          recursiveDirectoryWatcherCallbacks.forEach((recursiveDirectoryWatcherCallback) =>
+            recursiveDirectoryWatcherCallback(forwardSlash(normalizedPath))
+          );
+        }
       }
-    });
+    );
   }
 
   function getWriteFileSystem(path: string) {
@@ -180,18 +186,52 @@ function createControlledTypeScriptSystem(
       invokeFileWatchers(path, ts.FileWatcherEventKind.Changed);
     },
     watchFile(path: string, callback: ts.FileWatcherCallback): ts.FileWatcher {
-      return createWatcher(fileWatchersMap, path, callback);
+      return createWatcher(fileWatcherCallbacksMap, path, callback);
     },
     watchDirectory(
       path: string,
       callback: ts.DirectoryWatcherCallback,
-      recursive = false
+      recursive = false,
+      options?: ts.WatchOptions
     ): ts.FileWatcher {
-      return createWatcher(
-        recursive ? recursiveDirectoryWatchersMap : directoryWatchersMap,
+      let queuedWatcher: ts.FileWatcher | undefined;
+      if (ts.sys.watchDirectory) {
+        // watch directories as webpack will not trigger change for new files
+        // queue them to synchronize with the webpack compilation
+        const queuedCallbacks: (() => void)[] = [];
+        const sysWatcher = ts.sys.watchDirectory(
+          path,
+          (fileName: string) => {
+            const scopedCallback = () => callback(fileName);
+            queuedWatcherCallbacksSet.add(scopedCallback);
+            queuedCallbacks.push(scopedCallback);
+          },
+          recursive,
+          options
+        );
+        queuedWatcher = {
+          close() {
+            sysWatcher.close();
+            queuedCallbacks.forEach((queuedCallback) => {
+              queuedWatcherCallbacksSet.delete(queuedCallback);
+            });
+          },
+        };
+      }
+      const controlledWatcher = createWatcher(
+        recursive ? recursiveDirectoryWatcherCallbacksMap : directoryWatcherCallbacksMap,
         path,
         callback
       );
+
+      return {
+        close() {
+          if (queuedWatcher) {
+            queuedWatcher.close();
+          }
+          controlledWatcher.close();
+        },
+      };
     },
     // use immediate instead of timeout to avoid waiting 250ms for batching files changes
     setTimeout: (callback, timeout, ...args) => {
@@ -215,7 +255,7 @@ function createControlledTypeScriptSystem(
     invokeFileChanged(path: string) {
       const normalizedPath = realFileSystem.normalizePath(path);
 
-      if (deletedFiles.get(normalizedPath) || !fileWatchersMap.has(normalizedPath)) {
+      if (deletedFiles.get(normalizedPath) || !fileWatcherCallbacksMap.has(normalizedPath)) {
         invokeFileWatchers(path, ts.FileWatcherEventKind.Created);
         invokeDirectoryWatchers(normalizedPath);
 
@@ -233,6 +273,10 @@ function createControlledTypeScriptSystem(
 
         deletedFiles.set(normalizedPath, true);
       }
+    },
+    invokeQueuedChanged() {
+      queuedWatcherCallbacksSet.forEach((callback) => callback());
+      queuedWatcherCallbacksSet.clear();
     },
     clearCache() {
       passiveFileSystem.clearCache();
